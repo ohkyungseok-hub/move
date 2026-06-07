@@ -16,6 +16,7 @@ DETAIL_LIMIT = 9                # detail_1 ~ detail_9
 DEFAULT_ID_COL = "A"            # A파일 상품아이디 기본 열
 DEFAULT_CHUNK = 100             # 100행 단위 분할
 DEFAULT_OUT_SHEET_INDEX = 0     # b.xlsx 템플릿에서 값을 쓸 시트 (0=첫 시트)
+PROPOSAL_FORMAT_LABEL = "라스트오더 상품제안서"
 
 # =========================
 # Utils
@@ -63,6 +64,145 @@ def extract_bracket_items(val):
 
 def uniq_keep_order(seq):
     return list(dict.fromkeys(seq))
+
+
+def normalize_header(val):
+    if pd.isna(val):
+        return ""
+    return re.sub(r"\s+", "", str(val)).strip().lower()
+
+
+def find_header_col(header_values, *aliases):
+    normalized_aliases = {normalize_header(alias) for alias in aliases}
+    for idx, header in enumerate(header_values):
+        if normalize_header(header) in normalized_aliases:
+            return idx
+    return None
+
+
+def split_option_values(val):
+    if pd.isna(val):
+        return [""]
+
+    text = str(val).strip()
+    if not text or text.lower() == "nan" or text in {"단품", "상동"}:
+        return [""]
+
+    options = [part.strip() for part in re.split(r"[,，\n]+", text) if part.strip()]
+    return options or [""]
+
+
+def resolve_same_as_above(val, previous):
+    if pd.isna(val):
+        return val
+
+    text = str(val).strip()
+    if text == "상동":
+        return previous
+    return val
+
+
+def normalize_proposal_df(raw: pd.DataFrame):
+    """
+    라스트오더 상품제안서 양식:
+    - 1행은 안내 제목, 2행이 실제 헤더
+    - 기존 변환기는 고정 열 위치(A/C/D/E/H/I/J/M/P/S/T)를 참조하므로
+      상품제안서를 그 내부 A형식으로 변환해 기존 로직을 재사용한다.
+    """
+    required_headers = {"브랜드", "상품명", "재고수량", "소비자가", "판매가", "공급가"}
+    header_row_idx = None
+
+    for idx in range(min(len(raw), 10)):
+        normalized = {normalize_header(v) for v in raw.iloc[idx].tolist()}
+        if {normalize_header(v) for v in required_headers}.issubset(normalized):
+            header_row_idx = idx
+            break
+
+    if header_row_idx is None:
+        return None
+
+    header_values = raw.iloc[header_row_idx].tolist()
+    col_partner = find_header_col(header_values, "파트너사명")
+    col_brand = find_header_col(header_values, "브랜드")
+    col_name = find_header_col(header_values, "상품명")
+    col_option = find_header_col(header_values, "구성(옵션)", "구성")
+    col_expiry = find_header_col(header_values, "유통기한")
+    col_stock = find_header_col(header_values, "재고수량")
+    col_consumer_price = find_header_col(header_values, "소비자가")
+    col_sale_price = find_header_col(header_values, "판매가")
+    col_supply_price = find_header_col(header_values, "공급가")
+    col_tax = find_header_col(header_values, "면/과세", "면과세")
+    col_url = find_header_col(header_values, "판매링크URL", "판매링크 URL")
+
+    rows = raw.iloc[header_row_idx + 1:].reset_index(drop=True)
+    normalized_rows = []
+    extra_rows = []
+    previous_tax = ""
+
+    for _, source_row in rows.iterrows():
+        product_name = source_row.iloc[col_name] if col_name is not None else None
+        if pd.isna(product_name) or not str(product_name).strip():
+            continue
+
+        partner = source_row.iloc[col_partner] if col_partner is not None else ""
+        brand = source_row.iloc[col_brand] if col_brand is not None else ""
+        option_value = source_row.iloc[col_option] if col_option is not None else ""
+        expiry = source_row.iloc[col_expiry] if col_expiry is not None else ""
+        stock = source_row.iloc[col_stock] if col_stock is not None else ""
+        consumer_price = source_row.iloc[col_consumer_price] if col_consumer_price is not None else ""
+        sale_price = source_row.iloc[col_sale_price] if col_sale_price is not None else ""
+        supply_price = source_row.iloc[col_supply_price] if col_supply_price is not None else ""
+        tax = source_row.iloc[col_tax] if col_tax is not None else ""
+        sale_url = source_row.iloc[col_url] if col_url is not None else ""
+        tax = resolve_same_as_above(tax, previous_tax)
+        if pd.notna(tax) and str(tax).strip():
+            previous_tax = tax
+
+        pid = "^|^".join(
+            str(v).strip()
+            for v in [partner, brand, product_name]
+            if pd.notna(v) and str(v).strip()
+        )
+
+        for option in split_option_values(option_value):
+            row = ["" for _ in range(col_idx("T") + 1)]
+            row[col_idx("A")] = pid
+            row[col_idx("D")] = product_name
+            row[col_idx("E")] = option
+            row[col_idx("H")] = consumer_price
+            row[col_idx("I")] = supply_price
+            row[col_idx("J")] = sale_price
+            row[col_idx("M")] = stock
+            row[col_idx("P")] = expiry
+            normalized_rows.append(row)
+            extra_rows.append({
+                "_proposal_brand": brand,
+                "_proposal_tax": tax,
+                "_proposal_sale_url": sale_url,
+            })
+
+    if not normalized_rows:
+        return None
+
+    normalized_df = pd.DataFrame(normalized_rows)
+    for extra_key in ["_proposal_brand", "_proposal_tax", "_proposal_sale_url"]:
+        normalized_df[extra_key] = [extra[extra_key] for extra in extra_rows]
+
+    normalized_df.attrs["source_format"] = "proposal"
+    normalized_df.attrs["source_format_label"] = PROPOSAL_FORMAT_LABEL
+    return normalized_df
+
+
+def read_a_workbook(file_bytes: bytes, requested_id_col_letter: str):
+    raw_df = pd.read_excel(BytesIO(file_bytes), header=None)
+    proposal_df = normalize_proposal_df(raw_df)
+    if proposal_df is not None:
+        return proposal_df, "A"
+
+    default_df = pd.read_excel(BytesIO(file_bytes))
+    default_df.attrs["source_format"] = "default"
+    default_df.attrs["source_format_label"] = "기본 A파일"
+    return default_df, requested_id_col_letter
 
 
 def build_bd_from_group(a: pd.DataFrame, pid_series: pd.Series, pid_value: str, one_line: bool):
@@ -131,6 +271,7 @@ def make_b_rows_from_a(a: pd.DataFrame, id_col_letter: str):
         BD는 줄바꿈 유지
     - 매칭 뒤틀림 방지: 대표행/Series는 reset_index(drop=True) + to_numpy 사용
     """
+    is_proposal_format = a.attrs.get("source_format") == "proposal"
     pid = a.iloc[:, col_idx(id_col_letter)].astype(str).fillna("").str.strip()
     dup_mask = pid.duplicated(keep=False)
 
@@ -194,11 +335,18 @@ def make_b_rows_from_a(a: pd.DataFrame, id_col_letter: str):
 
         # 기본 매핑(대표행 기준)
         row["H"]  = a_rep.iloc[:, col_idx("D")].to_numpy()[i]  # 상품명
+        if is_proposal_format and "_proposal_brand" in a_rep:
+            row["J"] = a_rep["_proposal_brand"].to_numpy()[i]
         row["U"]  = a_rep.iloc[:, col_idx("I")].to_numpy()[i]
         row["V"]  = a_rep.iloc[:, col_idx("H")].to_numpy()[i]
         row["AC"] = a_rep.iloc[:, col_idx("M")].to_numpy()[i]  # 기존 요구: AC <- M (대표행)
-        row["AY"] = a_rep.iloc[:, col_idx("C")].to_numpy()[i]
-        row["AZ"] = a_rep.iloc[:, col_idx("C")].to_numpy()[i]
+        if is_proposal_format:
+            row["AY"] = ""
+            row["AZ"] = ""
+            row["AX"] = a_rep["_proposal_tax"].to_numpy()[i] if "_proposal_tax" in a_rep else ""
+        else:
+            row["AY"] = a_rep.iloc[:, col_idx("C")].to_numpy()[i]
+            row["AZ"] = a_rep.iloc[:, col_idx("C")].to_numpy()[i]
 
         # W = (H - J) 계산 후 "-1"
         h_val = pd.to_numeric(a_rep.iloc[:, col_idx("H")], errors="coerce").fillna(0).to_numpy()[i]
@@ -269,6 +417,7 @@ with st.expander("업로드 팁", expanded=True):
     st.write(
         "- 폴더처럼 쓰려면 **폴더 안 xlsx 여러 개를 한 번에 드래그&드롭** 하세요.\n"
         "- `b.xlsx` 템플릿은 앱에서 업로드하거나, 서버/로컬 실행 시 같은 폴더에 둬도 됩니다.\n"
+        "- `라스트오더 상품제안서` 양식도 A파일 업로드에 넣으면 자동으로 컬럼을 맞춥니다.\n"
         "- 결과는 **b.xlsx 템플릿의 모든 탭을 유지**한 상태로, 첫 시트에 값만 채웁니다.\n"
         "- 옵션 그룹은 상품아이디 중복으로 판단하며, 옵션 이미지(BD)는 한 줄로 합칩니다."
     )
@@ -321,16 +470,19 @@ if run_btn:
             msg = ""
             input_rows = 0
             out_files = 0
+            detected_format = ""
 
             try:
-                a_df = pd.read_excel(uf)
+                file_bytes = uf.getvalue()
+                a_df, effective_id_col_letter = read_a_workbook(file_bytes, id_col_letter)
+                detected_format = a_df.attrs.get("source_format_label", "기본 A파일")
                 input_rows = len(a_df)
 
-                ok, vmsg = validate_a_df(a_df, id_col_letter)
+                ok, vmsg = validate_a_df(a_df, effective_id_col_letter)
                 if not ok:
                     raise ValueError(vmsg)
 
-                rows = make_b_rows_from_a(a_df, id_col_letter)
+                rows = make_b_rows_from_a(a_df, effective_id_col_letter)
 
                 # split by chunk_size
                 chunks = split_rows(rows, int(chunk_size))
@@ -353,6 +505,7 @@ if run_btn:
             elapsed = round(time.time() - started, 3)
             summary_rows.append({
                 "file": uf.name,
+                "format": detected_format,
                 "status": status,
                 "input_rows": input_rows,
                 "output_files": out_files,
